@@ -39,11 +39,6 @@ library(RColorBrewer) # display.brewer.all(); brewer.pal
 library(httr) #
 
 
-WFS<-"http://si.icnf.pt/wfs/ardida_2018"
-
-
-
-
 # aux functions
 draw.legend<-function(lower=lower.bound, upper=upper.bound, COLORS=COLORS, locx=8000, ymin=5000,ymax=10000,YVAR=YVAR,YVARUNITS=YVARUNITS)
 {
