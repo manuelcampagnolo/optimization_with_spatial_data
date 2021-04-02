@@ -1,0 +1,554 @@
+folder<-"V:\\manel\\investigacao\\akli_"
+setwd(folder)
+
+# FUNCTIONS AND LIBRARIES
+source("synthetic.swath.2D.r")
+source("forward.inverse.mapping.modis.r")
+source("basic.functions.gifov.deg.meter.etc.r")
+# library to convert hdf to hdf5
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("rhdf5", quietly = TRUE))  BiocManager::install("rhdf5")
+library("rhdf5")
+library(sp) # point.in.polygon
+library(igraph)
+library(Rglpk) # function Rglpk_solve_LP
+library(RColorBrewer) # display.brewer.all(); brewer.pal
+library(httr) #
+
+
+WFS<-"http://si.icnf.pt/wfs/ardida_2018"
+
+
+
+
+# aux functions
+draw.legend<-function(lower=lower.bound, upper=upper.bound, COLORS=COLORS, locx=8000, ymin=5000,ymax=10000,YVAR=YVAR,YVARUNITS=YVARUNITS)
+{
+  extremos<-seq(lower,upper,length.out=length(COLORS)+1) # to define length(COLORS) rectangles
+  dify<-(ymax-ymin)/length(COLORS) # size of each rectangle
+  text(locx,ymin+length(COLORS)*dify,paste(YVAR,"  (", YVARUNITS, ")", sep=""),pos=3)
+  for (i in 1:length(COLORS))
+  {
+    locy<-ymin+(i-1)*dify
+    polygon(cbind(c(locx,locx+dify,locx+dify,locx),c(locy+dify,locy+dify,locy,locy)),col=COLORS[i] )
+    text(locx+dify, locy+dify/2,paste(round(extremos[i],2),"-", round(extremos[i+1],2)),pos=4)
+  }
+}
+
+# paint grid cells according to solution
+# reas is a data.frame with cols $grid and $lpsol
+plot.solution.grid.cells<-function(res,lower.bound=lower.bound, upper.bound=upper.bound, COLORS=COLORS,grid.cells.xy=grid.cells.xy,grid.size=grid.size, slope.grid=slope.grid )
+{
+  for (j in 1:nrow(res)) 
+    if (res[j,"lpsol"]>lower.bound) # only paint "active grid cells"
+    {
+      #choose color index for the grid cell
+      ind<-indice.cat(x=res[j,"lpsol"],xmin=lower.bound, xmax=upper.bound, k=length(COLORS))
+      xgrid<-grid.cells.xy$x[res$grid[j]]; ygrid<-grid.cells.xy$y[res$grid[j]]
+      #determine polygon that corresponds to the ind-th grid cell
+      newxy<-trapeze.grid(xgrid,ygrid,grid.size,slope.grid) # returns a matrix with columns x and y and 4 rows (counter-clockwise points)
+      polygon(newxy,col=COLORS[ind])
+      #text(l2gridxy[res$grid[j],"x"],l2gridxy[res$grid[j],"y"],round(100* res[j,"lpsol"],0),col="blue")
+    }
+}
+
+# function to extract from a data.frame df all rows (selection) for which the column atrib take a value in the vector x
+selection.in<-function(df,atrib,x)
+{
+  cond<-c()
+  for (i in 1:nrow(df)) cond<-c(cond,df[[atrib]][i] %in% x)
+  return(df[cond,])
+}
+# selection.in(res, "grid", adj[adj$swath==87,"grid"]) extracts rows of res where res$grid belongs to the set adj[adj$swath==87,"grid"]
+
+# prepare LP problem
+# solve LP problem for the cluster
+# subadj is a df that contains the grid cells, swath cells, and contrib for a connected component of the graph between grid cells and swath cells
+# tm.df is tha df with the swath info
+# YVAR is the response var (one column of tm.df)
+# LAMBDA is a parameter to set the problem
+#P1
+# problem without upper bounds on x_i and equality in \sum_i(x_i\times w_ij) == S_j. There is no solution: 
+# NO solution means that the problem is ill-defined: perhaps because the signal at the remaining swath cells are missing
+# min MIN \sum x_i where x_i are the signals from eac grid cell a
+# sa \sum_i(x_i\times w_ij) == S_j # S_j is the signal at the j-th swath cell and w_ij are the contributions of the i-th grid cell to the j-th swath cell
+#     lower.bound <= x_i 
+# P2
+# include fixed bound for x_i but relax  \sum_i(x_i\times w_ij) >= S_j
+# min MIN \sum x_i where x_i are the signals from eac grid cell: the result is nice but \sum_i(x_i\times w_ij) >= S_j  doesn't guarantee that it is consistent with the swath signal
+# sa \sum_i(x_i\times w_ij) >= S_j # S_j is the signal at the j-th swath cell and w_ij are the contributions of the i-th grid cell to the j-th swath cell
+#     lower.bound <= x_i <= upper.bounds (depend on the maximum signal for each grid cell)
+# P3 
+# min B, where B is a bound on beta_i's, the increases of the intensities w.r.t. the max_{i->j}(S_j)
+# sa  \sum_i(x_i\times w_ij) == S_j # S_j is the signal at the j-th swath cell and w_ij are the contributions of the i-th grid cell to the j-th swath cell
+#     lower.bound <= x_i 
+#     upper bounds for all grid cells: x_i -beta_i <= maximum signal for each grid cell 
+#     beta_i <= B for all grid cells
+ubs<-function(lubs,lambda){return(lambda*max(lubs)+(1-lambda)*lubs)}
+prepare.lp.problem<-function(P,subadj,tm.df,YVAR,LAMBDA=0,lower.bound,upper.signal=NULL) 
+{
+  ind.grid<-sort(unique(subadj$grid)) # indices of grid variables 
+  ind.swath<-sort(unique(subadj$swath))  # indices of swath variables
+  NG<-length(ind.grid) #  número de grid  cells
+  NS<-length(ind.swath)  # número de swath cells
+  
+  #obj
+  if (P=="P1" | P=="P2" | P=="P4") obj<-rep(1,NG) #min MIN \sum x_i where x_i are the signals from each grid cell 
+  #if (P=="P3") obj<-c(rep(0,NG),rep(0,NG),1)
+  if (P=="P3") obj<-c(rep(0,NG),rep(0,NS),1) # obj<-c(rep(0,NG),rep(0,NG),1) #min MIN B: as variáveis são x_i, beta_i, B
+  
+  # mat
+  # 1st: build  matrix with the contibutions w_ij from subadj
+  block.wij<-matrix(0, nrow=NS,ncol=NG) # each row is a swath cell, each column a grid cell
+  for (j in 1:nrow(subadj))
+  {
+    row<-seq_along(ind.swath)[subadj$swath[j]==ind.swath]
+    col<-seq_along(ind.grid)[subadj$grid[j]==ind.grid]
+    block.wij[row,col]<-subadj[j,"contrib"]
+  }
+    
+  if (P=="P1") mat<-rbind(block.wij,diag(rep(1,NG)))
+  if (P=="P4") mat<-rbind(block.wij,block.wij,diag(1,nrow=NG),diag(1,nrow=NG))
+  if (P=="P2") mat<-rbind(block.wij,diag(1,nrow=NG),diag(1,nrow=NG))
+  if (P=="P3") mat<-rbind(cbind(block.wij, diag(-1,nrow=NS), matrix(0,nrow=NS,ncol=1)),
+                          cbind(diag(1,nrow=NG), matrix(0,nrow=NG,ncol=NS+1)),
+                          cbind(matrix(0,nrow=NS,ncol=NG), diag(1,nrow=NS), matrix(-1,nrow=NS,ncol=1)))
+  
+  
+  #print(mat[(nrow(mat)-5):nrow(mat), (ncol(mat)-5):ncol(mat)])
+  #rhs
+  Sj<-tm.df[[YVAR]][ind.swath]  # NS valores da variável resposta no produto swath
+  if (P=="P1") rhs<-c(Sj,rep(lower.bound,NG)) #,upper.bounds) # valor máximo para a variável de decisão x_i
+  if (P=="P2" | P=="P3"| P=="P4") 
+  {
+    least.upper.bounds<-c()
+    # cycle through (unique) grid cells; # least upper bounds for  {x_1,...x_n}. if the bound is lower, the LP problem doesn't have a solution
+    for (k in 1:length(ind.grid)) least.upper.bounds<-c(least.upper.bounds, max(tm.df[[YVAR]][subadj[subadj$grid==ind.grid[k],"swath"]])) # the upper bound for each decision variable is the max value of YVAR at all the swath cells that are connected to the grid cell    
+    #upper.bounds<-ubs(least.upper.bounds,lambda=LAMBDA) 
+    if (P=="P2") rhs<-c(Sj,rep(lower.bound,NG),least.upper.bounds) #,upper.bounds) # valor máximo para a variável de decisão x_i
+    #if (P=="P3") rhs<-c(Sj,Sj,rep(lower.bound,NG),least.upper.bounds,rep(0,NG)) #,upper.bounds) # valor máximo para a variável de decisão x_i
+    if (P=="P3") rhs<-c(Sj,rep(lower.bound,NG),rep(0,NS)) 
+    if (P=="P4") rhs<-c(Sj,upper.signal,rep(lower.bound,NG),least.upper.bounds)
+  }
+  
+  #dir
+  if (P=="P1") dir<-c(rep("==",NS),rep(">=",NG)) 
+  if (P=="P4") dir<-c(rep(">=",NS),rep("<=",NS), rep(">=",NG),rep("<=",NG)) 
+  if (P=="P2") dir<-c(rep(">=",NS),rep(">=",NG),rep("<=",NG)) 
+  #if (P=="P3") dir<-c(rep(">=",NS),rep("<=",NS),rep(">=",NG),rep("<=",NG),rep("<=",NG)) 
+  if (P=="P3") dir<-c(rep("==",NS),rep(">=",NG),rep("<=",NS))
+  
+  return(list(obj=obj,mat=mat,rhs=rhs,dir=dir,ind.grid=ind.grid,ind.swath=ind.swath)) # ind.grid are the indices of the grid decision variables
+}
+
+# k classes entre xmin e xmax: devolve o indice da classe a que x pertence
+indice.cat<-function(x,xmin,xmax,k){min((1:k)[x <= seq(xmin,xmax,length.out=k+1)[-1]])} 
+
+
+#CONSTANTS
+R<-6371007.181 # Earth radius (m)
+Ti<-1111950 # tile size (m)
+grid.size<-Ti/4800 # grid cell resolution("250m" resolution)=~231m
+buffer.grid<-12 # number of grid cells to buffer the study area
+gifov.size<-1000 # for MOD14
+gifov.size.swir<-500 # SWIR reflectance
+COLORS<-brewer.pal(10, "Spectral") # c("blue","green","yellow","orange","red") # for plots
+nomefich<-"MCD14ML.20120720.005.Tavira_with_SWIR.dat"# new file to replace   "MCD14ML.20120720.005.Tavira.dat" #MCD14 data
+nomefich<-"MCD14ML.20120720.005.Tavira_with_SWIR.dat"
+urls<-list(Terra="ftp://ladsweb.nascom.nasa.gov/allData/6/MOD03/2012/202/",Aqua="ftp://ladsweb.nascom.nasa.gov/allData/6/MYD03/2012/202/")
+filenames<-data.frame(time=c(1126, 2229,  201, 1304),sat=c("T","T","A","A"),filename=c("MOD03.A2012202.1125.006.2012287121536.hdf","MOD03.A2012202.2225.006.2012287121531.hdf", "MYD03.A2012202.0200.006.2012202180439.hdf","MYD03.A2012202.1300.006.2012203151821.hdf" ))
+north.lat<-37.345 # restrict to Tavira  
+west.long<- -7.913
+
+##############
+#PARAMETERS
+YVAR<-"FRP"
+YVARUNITS<-"MW"
+LAMBDA<-1 # maximum lambda: all upper.bounds are going to be equal to max(least.upper.bounds)
+READ.NATIVE.DATA<-TRUE #FALSE
+CONVERT<-FALSE # converter hdf para hdf5: requer que h4toh5convert.exe esteja no sistema
+COMPUTE.ADJENCIES<-FALSE # FALSE # to compute adjency matrix using function swath.psf
+if (YVAR!="FRP") lower.bound<-min(tm.df[[YVAR]])  else lower.bound<-0 # lower bound on the decision variables
+###############
+
+# DETERMINE MODIS ORBITS TO CONSIDER
+# leitura dos dados mod14 a partir do ficheiro do Gerardo
+# 2 de junho de 2014
+#T21 and T31 are brightness temperatures in Kelvin degrees.
+#T21 centered at 3.9µm and T31 at 11µm
+#Sample is the granule sample of ???re pixel.
+#FRP is the Fire Radiative Power in MW
+#Conf is the confidence in the active fire identification in %
+
+if (!READ.NATIVE.DATA)
+{
+  # READ GERARDO's mod14 data
+  tm.df<-read.table(file.path(folder,nomefich), header=T,fill=TRUE)
+  # if READ.NATIVE.DATA then tm.df is going to be updated later
+  # if !READ.NATIVE.DATA then tm.df is going to loead from RData file later
+  tm.df<-tm.df[tm.df$lat <= north.lat & tm.df$lon >= west.long,] 
+  box<-list(minlat=min(tm.df$lat), maxlat=max(tm.df$lat), minlong=min(tm.df$lon), maxlong=max(tm.df$lon))
+}
+
+#> head(tm.df)
+#YYYYMMDD HHMM sat    lat    lon   T21   T31 sample   FRP conf
+#5  20120720 1126   T 37.270 -7.764 372.8 321.0    681 107.0  100
+#6  20120720 1126   T 37.275 -7.866 337.1 314.6    672  21.5   60
+#7  20120720 1126   T 37.261 -7.766 338.7 321.0    681  19.9   85
+
+
+
+if (READ.NATIVE.DATA) # if TRUE, read MOD/MYD03 hdf data, and extract values for the box computed above; UPDATE tm.df
+{
+  new.df<-tm.df[NULL,]
+  k<-1
+  for (k in 1:nrow(filenames))
+  {
+    df<-tm.df[tm.df$HHMM==filenames[k,"time"],] # subset of tm.df
+
+    # mod03 data set
+    # link location example: ftp://ladsweb.nascom.nasa.gov/allData/6/MOD03/2012/202/MOD03.A2012202.1125.006.2012287121536.hdf
+    hdfname<-as.character(filenames[k,"filename"])
+    #if (filenames[i,"sat"]=="T") ftpname<-urls$Terra     #"ftp://ladsweb.nascom.nasa.gov/allData/6/MOD03/2012/202/"
+    #if (filenames[i,"sat"]=="A") ftpname<-urls$Aqua     #"ftp://ladsweb.nascom.nasa.gov/allData/6/MOD03/2012/202/"
+    #DOWNLOAD<-FALSE
+    #if (DOWNLOAD)  download.file(url=,destfile=hdfname,mode="wb") # dá erro: só funciona se a url for http://...
+  
+    newfilename<-paste(hdfname,"5",sep="")
+    if (length(list.files(pattern=hdfname))>0 & length(list.files(pattern=newfilename))==0) #create hdf5 file if it doesn't exist
+    {
+      print(paste("create new hdf5 file",newfilename))
+      if (CONVERT) system(paste(shQuote("C:\\Program Files\\HDF_Group\\H4TOH5\\2.2.2\\bin\\h4toh5convert"), hdfname, newfilename), intern = FALSE, ignore.stderr = TRUE )
+      #OLD: system(paste('"C:\\Program Files\\HDF_Group\\H4TOH5\\2.2.2\\bin\\h4toh5convert"', hdfname, newfilename), intern = FALSE, ignore.stderr = TRUE )
+    }
+    # delete hdf file
+    DELETE<-FALSE
+    if (DELETE) file.remove(hdfname)
+    
+    # read VZA and azimuth
+    sensorZenith<-h5read(newfilename,"MODIS_Swath_Type_GEO/Data Fields/SensorZenith") #returns matrix 1354*2030
+    sensorAzimuth<-h5read(newfilename,"MODIS_Swath_Type_GEO/Data Fields/SensorAzimuth") 
+    lat<-h5read(newfilename,"MODIS_Swath_Type_GEO/Geolocation Fields/Latitude") # returns matrix 1354*2030
+    long<-h5read(newfilename,"MODIS_Swath_Type_GEO/Geolocation Fields/Longitude") 
+    N<-length(sensorZenith)
+    indices<-1:N
+    
+    # select swath cells to fall into the Tavira box
+    is<-indices[lat >= box$minlat & lat <= box$maxlat & long >= box$minlong & long <= box$maxlong]
+    out<-cbind(lat[is], long[is], sensorZenith[is], sensorAzimuth[is])
+    print(dim(out))
+    colnames(out)<-c("lat","long","sensorZenith","sensorAzimuth")
+    
+    # add sensorZenith and sensorAzimuth for the cells in tm.df
+    # after this, the matrix out won't be necessary anymore
+    n<-nrow(df)
+    df$sz<-vector(length=n); df$sa<-vector(length=n) ; df$latitude<-vector(length=n)  ; df$longitude<-vector(length=n) 
+    for (i in 1:n)
+    {
+      dlats<-(out[,"lat"]-df$lat[i])^2 # distances to the i-th element of df
+      dlongs<-(out[,"long"]-df$lon[i])^2
+      df$sz[i]<-out[which.min(dlats+dlongs),"sensorZenith"]/100 # to be in degrees
+      df$sa[i]<-out[which.min(dlats+dlongs),"sensorAzimuth"]/100 # to be in degrees
+      df$latitude[i]<-out[which.min(dlats+dlongs),"lat"]
+      df$longitude[i]<-out[which.min(dlats+dlongs),"long"]
+    }
+    if (k==1) new.df<-df else new.df<-rbind(new.df,df)
+  }
+  save(new.df,file="new.df.RData")
+}
+if (!READ.NATIVE.DATA) load(file="new.df.RData") # load tm.df which already has columns "lat","long","sensorZenith","sensorAzimuth" extrated from MOD03
+ 
+##new.df<-new.df[sort(c(129,130,114,115,135,136,137,124,109,128)),]
+#new.df<-new.df[c(1,4,65,66,69:71,73,152:154,159,160),]
+
+new.df<-new.df[new.df$HHMM==ORBIT.TIME,]
+upper.bound<-max(new.df[[YVAR]]) # upper bound for decision variables (it has to be at least max(tm.df[[YVAR]]) for the LP problem be possible)
+
+# determine centers (lat/long) of modis sin grid cells (~250m) over the study area
+LAT<-(box$minlat+box$maxlat)/2 # in degrees
+LONG<-(box$minlong+box$maxlong)/2
+ncolgrid<-cos(pi*LAT/180)*(-box$minlong+box$maxlong)*111000/grid.size # approx number of columns of grid cells to cover the study area
+nrowgrid<-(-box$minlat+box$maxlat)*111000/grid.size # approx number of rows of grid cells to cover the study area
+grid.cells.lat.long<-study.area.cells(LONG,LAT,studyW=-floor(buffer.grid+ncolgrid/2),studyE=floor(buffer.grid+ncolgrid/2),studyN=-floor(buffer.grid+nrowgrid/2),studyS=floor(buffer.grid+nrowgrid/2))
+#plot(grid.cells.lat.long$longlat,pch="+") # grid.cells.lat.long$longlat is n*2 matrix with columns study.area.long and study.area.lat
+#text(new.df$lon, new.df$lat, new.df$FRP)
+
+# project coordinates to x,y (azimuthal projection centered in LAT/LONG)
+# output: list grid.cells.xy with $x and $y and matrix n*2 l2gridxy with columns "x" and "y"
+#         update data frame new.df with columns $x and $y
+grid.cells.xy<-list()
+grid.cells.xy$x<-pi*(grid.cells.lat.long$longlat[,"study.area.long"]-LONG)*R*cos(pi*LAT/180)/180
+grid.cells.xy$y<-pi*(grid.cells.lat.long$longlat[,"study.area.lat"]-LAT)*R/180
+new.df$y<-pi*(new.df$latitude-LAT)*R/180
+new.df$x<-pi*(new.df$longitude-LONG)*R*cos(pi*LAT/180)/180
+ncs<-grid.cells.lat.long$nc; nrs<-grid.cells.lat.long$nr
+l2gridxy<-cbind(grid.cells.xy$x,grid.cells.xy$y) # the matrix has 2 columns (x and y). Each column of the matrix is read by *rows* of the image clip
+colnames(l2gridxy)<-c("x","y")
+
+
+# determine slope.grid (dx/dy)
+mat.x<-matrix(l2gridxy[,1],nrow=nrs,ncol=ncs,byrow=TRUE)#; print(mat.x)
+mat.y<-matrix(l2gridxy[,2],nrow=nrs,ncol=ncs,byrow=TRUE)#; print(mat.y)
+ymean<-apply(mat.y,1,mean)[c(1,nrs)] # vector with 2 components: mean of y in the 1st and last rows
+xmean<-apply(mat.x,1,mean)[c(1,nrs)] # vector with 2 components: mean of x in the 1st and last rows
+slope.grid<-diff(xmean)/diff(ymean) # azimuth
+print(paste("slope.grid tavira",slope.grid)) # slope.grid (dx/dy) small and negative (~ -0.09)
+
+
+#text(grid.cells.xy$x,grid.cells.xy$y, 1:length(grid.cells.xy$x))
+#text(new.df$x, new.df$y, 1:length(new.df$x),col="blue")
+
+# determine contribution for all swath cells and build adjacency list
+if (COMPUTE.ADJENCIES)
+{
+  print("computing adjencies ...")
+  adj<-data.frame(swath=c(),grid=c(),contrib=c())
+  for (i in 1:nrow(new.df)) # cycle through all swath cells
+  {
+    # determine slope of the swath cell (dx/dy)
+    sa<-new.df[i,"sa"] # sensor azimuth already in degrees
+    if ((sa>0 & sa<90) | (sa< -90)) slope<-abs(1/tan(pi*sa/180)) # positive slope: if sa=20deg then slope=2.74
+    if ((sa<0 & sa> -90) | (sa> 90)) slope<- -abs(1/tan(pi*sa/180)) # negative slope 
+    if (sa==90 | sa== -90) slope<-0
+    
+    # determine subset of grid cells that intersect the support of the i-th swath cell
+    # 1st determine the polygon around the swath cell: here psfgrid is irrelevant
+    # the output is a 5*2 matrix with the coordinates of the support
+    # AND PLOT THE SUPPORTS 
+    support<-swath.psf(X=new.df[i,"x"],Y=new.df[i,"y"],vza=new.df[i,"sz"],slope=slope,psfgrid=psfgrid.function(50),thickness=1,poly.pnts=rbind(c(0,0),c(0,0)),support=TRUE,gridplot=FALSE,swath.res=gifov.size)$support
+    colnames(support)<-c("x","y")
+    #polygon(support)
+    # enlarge the polygon (buffer)
+    buf<-grid.size 
+    gx<-support[,"x"]; gy<-support[,"y"]; support.big<-rbind(cbind(gx-buf,gy),cbind(gx+buf,gy),cbind(gx,gy-buf),cbind(gx,gy+buf))
+    indices<-chull(support.big) #indices of the points lying on the convex hull, in clockwise order
+    hull<-support.big[indices,] # 2col matrix of points that define the buffer
+    #polygon(hull)
+                       
+    # 2nd check which grid cells have the center inside that polygon
+    subindices<-1:length(grid.cells.xy$x)
+    subindices<-subindices[point.in.polygon(point.x=grid.cells.xy$x, point.y=grid.cells.xy$y, pol.x<-hull[,1], pol.y=hull[,2])>0]# vector of 0,1,2, or 3 (0 means strictly exterior to the polygon)
+      
+    # for each grid cell in that subset compute the contribution (obscov) to the i-th swath cell
+    aux.adj<-data.frame(swath=c(),grid=c(),contrib=c()) # auxiliary df just for the i-th swath cell
+    for (ind in subindices) # cycle through all grid cells that contribute to the i-th swath cell
+    {
+      xgrid<-grid.cells.xy$x[ind]; ygrid<-grid.cells.xy$y[ind]
+      #determine polygon that corresponds to the ind-th grid cell
+      newxy<-trapeze.grid(xgrid,ygrid,grid.size,slope.grid) # returns a matrix with columns x and y and 4 rows (counter-clockwise points)
+      
+      #lines(x=c(newxy[,1],newxy[1,1]),y=c(newxy[,2],newxy[1,2]))#,col="blue")
+      obscov<-swath.psf(X=new.df[i,"x"],Y=new.df[i,"y"],vza=new.df[i,"sz"],slope=slope,psfgrid=psfgrid.function(50),thickness=0,poly.pnts=newxy,support=TRUE,gridplot=FALSE,swath.res=gifov.size)$convol
+      #update fata frame adj with the computed obscov
+      if (obscov >0) {aux.adj<-rbind(aux.adj,data.frame(swath=i,grid=ind,contrib=obscov))}
+    } 
+    aux.adj$contrib<-aux.adj$contrib/sum(aux.adj$contrib) # to be sure that the sum is 1 (it is approx 1 because of the discretization)
+    adj<-rbind(adj,aux.adj) # update the adjacency list for the whole graph
+  }
+  save(adj,file=paste("adjency.list.",ORBIT.TIME,".RData",sep=""))
+}
+if (!COMPUTE.ADJENCIES)  {print("reading adjency.list.RData"); load(file=paste("adjency.list.", ORBIT.TIME,".RData",sep=""))} # load data.frame adj 
+
+# build bi-partite graph; 
+# 1st: rename vertices so grid cells and swath cells don't have the same names
+swath.vertices<-paste("s",adj$swath,sep="")
+grid.vertices<-paste("g",adj$grid,sep="")
+#G<-graph.edgelist(cbind(swath.vertices,grid.vertices), directed=FALSE)
+G<-graph.data.frame(data.frame(swath=swath.vertices, grid=grid.vertices, weights=adj$contrib),directed=FALSE)
+# clusters returns
+#$membership  , numeric vector giving the cluster id to which each vertex belongs.
+#$csize  , numeric vector giving the sizes of the clusters.
+#$no	, numeric constant, the number of clusters.
+components<-clusters(G) 
+# data.frame that associates each vertex (named say  "s2845" or "g98") its cluster number 
+clus<-data.frame(name=get.data.frame(G,what="vertices"),number=components$membership)
+# function that returns number of cluster for any vertex (type="g" or type="s")
+cluster<-function(type,index){clus$number[clus$name==paste(type,index,sep="")]}
+
+# plot clusters
+#for (k in unique(clus$number)) for (i in adj$grid) if (length(cluster(type="g",index=i))>0) if (cluster(type="g",index=i)==k) {text(l2gridxy[i,"x"],l2gridxy[i,"y"],"*",col=topo.colors(6)[k],cex=3)}
+#for (i in adj$swath) text(new.df[i,"x"],new.df[i,"y"],clus[clus$name==paste("s",i,sep=""),"number"],col="blue",cex=3)
+
+
+
+# cycle through the components of the graph
+STATUS<-c() # means that there is a solution to the problem
+if (P=="P1" | P=="P2"| P=="P4") res<-data.frame(grid=c(),lpsol=c()) # data frame que vai guardar o resultado (índice grid cell, valor da solução)
+if (P=="P3")  res<-data.frame(grid=c(),lpsol=c())#,over.bounds=c())
+for (i in 1:components$no)
+{
+  swath.vertices<-as.numeric(substring(clus$name[clus$number==i & substring(clus$name,1,1)=="s"],2)) # indices of subset of swath vertices of component i 
+  #aux<-rep(FALSE,length(adj$swath)); for (j in swath.vertices)  aux[adj$swath==j]<-TRUE # logical vector that is an indicatrix for the cluster in adj
+  #subadj<-adj[aux,]
+  subadj<-selection.in(adj,"swath",swath.vertices)
+  print(i)
+  print(dim(subadj))
+  # > subadj
+  #     swath grid      contrib
+  #4351    83  697 6.954855e-04
+  #4352    83  698 1.197781e-04
+  #...
+  lpp<-prepare.lp.problem(P,subadj,new.df,YVAR,LAMBDA,lower.bound)
+  #sol<-lp("min",objective.in=obj,const.mat=mat,const.dir=dir,const.rhs=rhs)$solution
+  SOLUTION<-Rglpk_solve_LP(lpp$obj, lpp$mat, lpp$dir, lpp$rhs, max=FALSE) # here, by default, the decision variable are between 0 and +inf
+  sol<-SOLUTION$solution
+  STATUS<-c(STATUS,SOLUTION$status) 
+  NG<-length(lpp$ind.grid)
+  NS<-length(lpp$ind.swath)
+  if (P=="P3")  print(paste("B=",sol[NG+NS+1])) #sol[NG+NG+1]))
+  
+  if (P=="P3")
+  {
+    Sj<-new.df[[YVAR]][lpp$ind.swath] # swath signal
+    print(round(Sj,1))
+    betas<-sol[(NG+1):(NG+NS)]
+    print(round(betas,1))
+    lpp<-prepare.lp.problem(P="P4",subadj,new.df,YVAR,LAMBDA,lower.bound,upper.signal=Sj+betas)
+    SOLUTION<-Rglpk_solve_LP(lpp$obj, lpp$mat, lpp$dir, lpp$rhs, max=FALSE) # here, by default, the decision variable are between 0 and +inf
+    sol<-SOLUTION$solution
+    STATUS<-c(STATUS,SOLUTION$status) 
+  }
+  res<-rbind(res,data.frame(grid=lpp$ind.grid,lpsol=sol[1:NG])) # keep indices of variables their values in the optimum solution
+} # end cycle through components of the graph
+
+lp.status<- paste(STATUS,collapse=" ")  #it will return 0 for the optimal solution being found, and non-zero otherwise
+
+# compute signal at each swath cell according to the optimal solution
+signal<-rep(0,nrow(new.df))
+for (i in 1: nrow(adj))
+{
+  signal[adj[i,"swath"]]<-signal[adj[i,"swath"]]+adj[i,"contrib"]*res[res$grid==adj[i,"grid"],"lpsol"]
+}
+
+#### PLOT 1 ###############################################################################################################
+swir.support<-function(support,corner)
+{
+  # 4 corner of support
+  ulc<-support["ulc",]
+  llc<-support["llc",]
+  lrc<-support["lrc",]
+  urc<-support["urc",]
+  # 5 extra corners of support
+  center<-apply(support[1:4,],2,mean)
+  left<-apply(support[c("ulc","llc"),],2,mean)
+  right<-apply(support[c("urc","lrc"),],2,mean)
+  up<-apply(support[c("urc","ulc"),],2,mean)
+  down<-apply(support[c("llc","lrc"),],2,mean)
+  if (corner=="swir_ulc") return(rbind(ulc,left,center,up,ulc))
+  if (corner=="swir_llc") return(rbind(left,llc,down,center,left))
+  if (corner=="swir_lrc") return(rbind(center,down,lrc,right,center))
+  if (corner=="swir_urc") return(rbind(up,center,right,urc,up))
+}
+
+# if swir available plot swir date
+if (max(is.na(new.df[,c( "swir_ulc" , "swir_urc" , "swir_llc" , "swir_lrc" )]))==0) # swir available -> extra plot
+{
+  par(mfrow=c(1,3)) 
+  # plot swir reflectance 
+  title<-"SWIR"
+  plot(grid.cells.xy$x,grid.cells.xy$y, pch="",xlab="meters",ylab="meters",main=title) # main="Swath observations") 
+  
+  # draw legend for plot of swath cells
+  min.swir<-min(new.df[,c( "swir_ulc" , "swir_urc" , "swir_llc" , "swir_lrc" )])
+  max.swir<-max(new.df[,c( "swir_ulc" , "swir_urc" , "swir_llc" , "swir_lrc" )])
+  draw.legend(lower=min.swir, upper=max.swir, COLORS=COLORS, locx=8000, ymin=5000,ymax=12000,YVAR="SWIR",YVARUNITS="0-1")
+  # draw supports
+  for (j in (1:nrow(new.df))[order(apply(new.df[,c( "swir_ulc" , "swir_urc" , "swir_llc" , "swir_lrc" )],1,max))]) 
+  {
+    # determine slope of the swath cell (dx/dy)
+    sa<-new.df[j,"sa"] # sensor azimuth already in degrees
+    if ((sa>0 & sa<90) | (sa< -90)) slope<-abs(1/tan(pi*sa/180)) # positive slope: if sa=20deg then slope=2.74
+    if ((sa<0 & sa> -90) | (sa> 90)) slope<- -abs(1/tan(pi*sa/180)) # negative slope 
+    if (sa==90 | sa== -90) slope<-0
+    
+    # determine subset of grid cells that intersect the support of the i-th swath cell
+    # the output is a 5*2 matrix with the coordinates of the support
+    # the order of coord of support are (ulc, llc, lrc, urc, ulc)
+    support<-swath.psf(X=new.df[j,"x"],Y=new.df[j,"y"],vza=new.df[j,"sz"],slope=slope,psfgrid=psfgrid.function(50),thickness=1,poly.pnts=rbind(c(0,0),c(0,0)),support=TRUE,gridplot=FALSE,swath.res=gifov.size)$support
+    colnames(support)<-c("x","y")
+    rownames(support)<-c("ulc","llc","lrc","urc","back_to_ulc")
+    # cycle through swir cells
+    for (corner in c("swir_ulc","swir_llc","swir_lrc","swir_urc"))
+    {
+      val.swir<-new.df[j,corner]; 
+      supp<-swir.support(support,corner)      
+      ind<-indice.cat(x=val.swir,xmin=min.swir, xmax=max.swir,k=length(COLORS))
+      polygon(supp,col=COLORS[ind])
+      #text(x=new.df[j,"x"],y=new.df[j,"y"],round(new.df[j,YVAR],0),cex=0.7)
+    }
+  }
+}
+
+if (max(is.na(new.df[,c( "swir_ulc" , "swir_urc" , "swir_llc" , "swir_lrc" )]))!=0)  par(mfrow=c(1,2)) # no swir available data: plot of solution and pplot of swath data
+
+#### PLOT 2 ###############################################################################################################
+# plot base plot for solution of lp problem
+plot(grid.cells.xy$x,grid.cells.xy$y, pch="",xlab="meters",ylab="meters",main=paste("lat=",round(LAT,3),"long=",round(LONG,3),sep=" ")) # ,xlim=c(1800,2500),ylim=c(1800,2800) )
+#text(0,300,paste("lat=",round(LAT,3),sep=""))
+#text(0,-300,paste("long=",round(LONG,3),sep=""))
+
+# draw legend for plot of grid cells
+draw.legend(lower=lower.bound, upper=max(res$lpsol), COLORS=COLORS, locx=8000, ymin=5000,ymax=12000,YVAR=YVAR,YVARUNITS=YVARUNITS)
+
+# draw lp solution 
+plot.solution.grid.cells(res,lower.bound=lower.bound, upper.bound=max(res$lpsol), COLORS=COLORS,grid.cells.xy=grid.cells.xy,grid.size=grid.size, slope.grid=slope.grid )
+ 
+# draw swath supports
+for (j in (1:nrow(new.df))[order(new.df[[YVAR]])]) 
+{
+  # determine slope of the swath cell (dx/dy)
+  sa<-new.df[j,"sa"] # sensor azimuth already in degrees
+  if ((sa>0 & sa<90) | (sa< -90)) slope<-abs(1/tan(pi*sa/180)) # positive slope: if sa=20deg then slope=2.74
+  if ((sa<0 & sa> -90) | (sa> 90)) slope<- -abs(1/tan(pi*sa/180)) # negative slope 
+  if (sa==90 | sa== -90) slope<-0
+  
+  # determine subset of grid cells that intersect the support of the i-th swath cell
+  # the output is a 5*2 matrix with the coordinates of the support
+  support<-swath.psf(X=new.df[j,"x"],Y=new.df[j,"y"],vza=new.df[j,"sz"],slope=slope,psfgrid=psfgrid.function(50),thickness=1,poly.pnts=rbind(c(0,0),c(0,0)),support=TRUE,gridplot=FALSE,swath.res=gifov.size)$support
+  colnames(support)<-c("x","y")
+  ind<-indice.cat(x=new.df[[YVAR]][j],xmin=lower.bound, xmax=upper.bound,k=length(COLORS))
+  polygon(support)
+}
+
+#### PLOT 3 ###############################################################################################################
+# plot swath response in a new plot
+if ( max(as.numeric(strsplit(lp.status," ")[[1]])) ==0) title<-paste("Swath orbit", ORBIT.TIME, "VZA", round(mean(new.df$sz)), "deg") else title<-paste("orbit", ORBIT.TIME, lp.status)
+plot(grid.cells.xy$x,grid.cells.xy$y, pch="",xlab="meters",ylab="meters",main=title) # main="Swath observations") 
+
+# draw legend for plot of swath cells
+draw.legend(lower=lower.bound, upper=upper.bound, COLORS=COLORS, locx=8000, ymin=5000,ymax=12000,YVAR=YVAR,YVARUNITS=YVARUNITS)
+
+# draw supports
+for (j in (1:nrow(new.df))[order(new.df[[YVAR]])]) 
+{
+  # determine slope of the swath cell (dx/dy)
+  sa<-new.df[j,"sa"] # sensor azimuth already in degrees
+  if ((sa>0 & sa<90) | (sa< -90)) slope<-abs(1/tan(pi*sa/180)) # positive slope: if sa=20deg then slope=2.74
+  if ((sa<0 & sa> -90) | (sa> 90)) slope<- -abs(1/tan(pi*sa/180)) # negative slope 
+  if (sa==90 | sa== -90) slope<-0
+  
+  # determine subset of grid cells that intersect the support of the i-th swath cell
+  # the output is a 5*2 matrix with the coordinates of the support
+  support<-swath.psf(X=new.df[j,"x"],Y=new.df[j,"y"],vza=new.df[j,"sz"],slope=slope,psfgrid=psfgrid.function(50),thickness=1,poly.pnts=rbind(c(0,0),c(0,0)),support=TRUE,gridplot=FALSE,swath.res=gifov.size)$support
+  colnames(support)<-c("x","y")
+  ind<-indice.cat(x=new.df[[YVAR]][j],xmin=lower.bound, xmax=upper.bound,k=length(COLORS))
+  polygon(support,col=COLORS[ind])
+  text(x=new.df[j,"x"],y=new.df[j,"y"],round(new.df[j,YVAR],0),cex=0.7)
+}
+#for (j in (1:nrow(new.df))[order(new.df[[YVAR]])]) text(x=new.df[j,"x"],y=new.df[j,"y"],round(signal[j]-new.df[j,YVAR],0),cex=0.8)
+#for (j in (1:nrow(new.df))[order(new.df[[YVAR]])]) 
+
+# write swath indices: 
+#for (j in (1:nrow(new.df))[order(new.df[[YVAR]])]) text(x=new.df[j,"x"],y=new.df[j,"y"],j,cex=0.8)
+
+# to check what's happening with swath cell S
+if (FALSE)
+{
+  for (S in 1:nrow(new.df))
+  {
+    aux<-selection.in(adj, "grid", adj[adj$swath==S,"grid"]) # returns contributions of all grid cells that contribute to swath cell S
+    aus<-cbind(selection.in(res, "grid", adj[adj$swath==S,"grid"]), selection.in(aux,"swath",S)) # returns LP solution, bound and contributions
+    # compute total signal to cell 87
+    print(paste("signal to swath cell", S, "is", round(sum(aus$lpsol*aus$contrib),1), "when real signal is",new.df[[YVAR]][S]))
+  }
+}
