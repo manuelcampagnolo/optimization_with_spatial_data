@@ -1,3 +1,26 @@
+# main.batch
+if (FALSE)
+{
+  folder<-"Z:\\manel\\investigacao\\akli_"
+  setwd(folder)
+
+  YVAR<-"FRP"
+  YVARUNITS<-"MW"
+  ORBIT.TIME<-1126 #1126 #2229  201 1304 # used to select subset of MOD14 data
+  READ.NATIVE.DATA<-FALSE
+  CONVERT<-FALSE # converter hdf para hdf5: requer que h4toh5convert.exe esteja no sistema
+  COMPUTE.ADJENCIES<-FALSE # FALSE # to compute adjency matrix using function swath.psf
+  P<-"P2"  # "P2" (minimize sum x_i) or "P3" (minimize B)
+  LAMBDA<-0
+  CREATE.JPEG<-FALSE
+
+  name.file<-paste("Tavira_2012_july_20_",ORBIT.TIME,"_orbit_yvar_",YVAR,"_250m_",substring(Sys.time(),1,10),sep="")
+  if (CREATE.JPEG) jpeg(file=paste(name.file,"jpg",sep="."), bg = "transparent",width = 40, height = 20, res=600,units = "cm",quality=100)
+  source("main.r") 
+  if (CREATE.JPEG)  dev.off()
+}
+
+
 folder<-"V:\\manel\\investigacao\\akli_"
 setwd(folder)
 
